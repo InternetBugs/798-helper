@@ -93,7 +93,11 @@ import os
 import zipfile
 
 with zipfile.ZipFile('build/unsigned.apk', 'a', zipfile.ZIP_DEFLATED) as z:
-    z.write('build/dex/classes.dex', 'classes.dex')
+    # Store classes.dex uncompressed: the daemon maps a module's dex straight
+    # out of the APK, and a stored entry lets it map the file instead of
+    # inflating it first.
+    z.write('build/dex/classes.dex', 'classes.dex',
+            compress_type=zipfile.ZIP_STORED)
     for root, _, files in os.walk('module/meta'):
         for f in files:
             p = os.path.join(root, f)
