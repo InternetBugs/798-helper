@@ -1,0 +1,9 @@
+build/
+tools/
+apk/
+shots/
+*.apk
+*.keystore
+*.jks
+.release-pass
+.release-b64
