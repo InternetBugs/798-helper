@@ -22,10 +22,15 @@ jobs:
 
       # The runner ships the SDK at $ANDROID_HOME; android-actions/setup-android@v3
       # is broken (it still tries to install the removed "tools" package).
-      - name: Install SDK packages
+      - name: Ensure Android SDK
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          if [ ! -x "$SDK/build-tools/35.0.0/aapt2" ]; then
+            SDKM=$(find "$SDK/cmdline-tools" -name sdkmanager -type f | head -1)
+            yes | "$SDKM" --licenses > /dev/null || true
+            "$SDKM" "platforms;android-35" "build-tools;35.0.0"
+          fi
 
       - name: Fetch libxposed api
         run: |
