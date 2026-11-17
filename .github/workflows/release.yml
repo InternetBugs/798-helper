@@ -20,10 +20,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
-
+      # The runner ships the SDK at $ANDROID_HOME; android-actions/setup-android@v3
+      # is broken (it still tries to install the removed "tools" package).
       - name: Install SDK packages
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
       - name: Fetch libxposed api
         run: |
