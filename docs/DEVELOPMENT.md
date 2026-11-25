@@ -9,10 +9,10 @@ module/
   AndroidManifest.xml          模块清单（无 activity）
   res/values/strings.xml       模块名与描述
   meta/META-INF/xposed/        libxposed 现代 API 的声明文件
-    java_init.list             入口类：com.n798.cloudora.Hook
+    java_init.list             入口类：io.github.internetbugs.helper798.Hook
     scope.list                 作用域：com.cloudora.android
     module.prop                minApiVersion / targetApiVersion / staticScope
-  src/com/n798/cloudora/
+  src/io/github/internetbugs/helper798/
     Hook.java                  XposedModule 入口
     AdBlock.java               广告位拦截
     NavBlock.java              底栏「积分」选项卡
@@ -20,7 +20,7 @@ module/
 build.sh                       构建脚本（本地与 CI 共用）
 ```
 
-模块包名固定为 `com.n798.cloudora`。LSPosed 按包名登记模块，改包名等于换了一个模块，需要在管理器里重新启用。
+模块包名固定为 `io.github.internetbugs.helper798`。LSPosed 按包名登记模块，改包名等于换了一个模块，需要在管理器里重新启用。
 
 ## 框架
 
@@ -76,7 +76,7 @@ Kotlin 编译器为带默认参数的方法生成 `xxx$default` 合成方法，�
 bash build.sh
 ```
 
-产物 `build/n798-cloudora.apk`。
+产物 `build/798-helper.apk`。
 
 环境变量：
 
@@ -101,8 +101,8 @@ Windows 上 `bash build.sh` 可能被 WSL 接管而不是 Git Bash，那就改�
 推一个 `v*` 标签即可，GitHub Actions 会自动编译并附到 Release 上：
 
 ```bash
-git tag v1.3.0
-git push origin v1.3.0
+git tag v1.4.0
+git push origin v1.4.0
 ```
 
 版本号规则：`vMAJOR.MINOR.PATCH` → `versionCode = MAJOR*10000 + MINOR*100 + PATCH`。手动触发 workflow 时版本号取 `0.0.<run_number>`，只上传 artifact 不发 Release。
@@ -112,8 +112,8 @@ git push origin v1.3.0
 ## 安装到设备
 
 ```bash
-adb push build/n798-cloudora.apk /data/local/tmp/n798.apk
-adb shell pm install -t -r -d /data/local/tmp/n798.apk
+adb push build/798-helper.apk /data/local/tmp/798-helper.apk
+adb shell pm install -t -r -d /data/local/tmp/798-helper.apk
 ```
 
 HyperOS 上 `adb install` 会报 `INSTALL_FAILED_USER_RESTRICTED`；`pm install` 必须带 `-d`（降级）才能过 MIUI 的校验。

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build com.n798.cloudora. Run from the repo root.
+# Build io.github.internetbugs.helper798. Run from the repo root.
 #
 # Local use:   bash build.sh
-# CI use:      VERSION_NAME=1.3.0 VERSION_CODE=10300 KEYSTORE=... bash build.sh
+# CI use:      VERSION_NAME=1.4.0 VERSION_CODE=10400 KEYSTORE=... bash build.sh
 #
 # Environment:
 #   ANDROID_HOME / ANDROID_SDK_ROOT   SDK root (default: tools/android-sdk)
@@ -26,7 +26,7 @@ BT_VERSION="${BUILD_TOOLS_VERSION:-35.0.0}"
 BT="$SDK/build-tools/$BT_VERSION"
 AJ="$SDK/platforms/android-35/android.jar"
 API_JAR="${API_JAR:-tools/api-102.jar}"
-OUT="${OUT:-build/n798-cloudora.apk}"
+OUT="${OUT:-build/798-helper.apk}"
 
 # aapt2/d8/apksigner are .exe/.bat on Windows and bare scripts elsewhere.
 pick() {

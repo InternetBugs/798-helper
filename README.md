@@ -32,7 +32,7 @@
 
 ## 安装
 
-1. 到 [Releases](../../releases/latest) 下载 `n798-cloudora.apk`
+1. 到 [Releases](../../releases/latest) 下载 `798-helper.apk`
 2. 安装它。**桌面和应用列表里不会出现图标，这是正常的**——它没有界面，是个后台模块
 3. 打开 **LSPosed** → 底部「模块」→ 找到「**798 助手**」→ 打开右边开关
 4. 点进「798 助手」，在作用域里勾选「**慧生活798**」
@@ -44,7 +44,7 @@
 
 **LSPosed 的模块列表里找不到它**
 
-先把列表下拉刷新一次。还是没有的话，确认装的是 Releases 里的那个 apk，然后在终端跑 `adb shell pm list packages | grep n798`，能查到 `com.n798.cloudora` 就说明装上了。
+先把列表下拉刷新一次。还是没有的话，确认装的是 Releases 里的那个 apk，然后在终端跑 `adb shell pm list packages | grep internetbugs`，能查到 `io.github.internetbugs.helper798` 就说明装上了。
 
 **装好了、开关也开了，广告还在**
 
@@ -53,6 +53,10 @@
 **更新模块要重新设置吗**
 
 不用。直接装新版覆盖安装，LSPosed 里的开关和作用域都会保留。
+
+**从 1.3.x 升上来，装完出现两个「798 助手」**
+
+1.4.0 起模块包名从 `com.n798.cloudora` 换成了 `io.github.internetbugs.helper798`，系统按包名区分，所以不会覆盖安装。在 LSPosed 里停用（或直接卸载）旧的 `com.n798.cloudora`，只留新版，然后强制停止「慧生活798」再打开。
 
 **想临时关掉**
 

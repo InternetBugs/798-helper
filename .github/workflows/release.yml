@@ -76,15 +76,15 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: n798-cloudora-${{ steps.version.outputs.name }}
-          path: build/n798-cloudora.apk
+          name: 798-helper-${{ steps.version.outputs.name }}
+          path: build/798-helper.apk
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: build/n798-cloudora.apk
+          files: build/798-helper.apk
           generate_release_notes: true
           body: |
-            下载 `n798-cloudora.apk`，安装后在 LSPosed 里启用，作用域勾选「慧生活798」。
+            下载 `798-helper.apk`，安装后在 LSPosed 里启用，作用域勾选「慧生活798」。
             模块没有桌面图标，装完在桌面找不到是正常的。
