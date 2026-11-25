@@ -1,4 +1,4 @@
-package com.n798.cloudora;
+package io.github.internetbugs.helper798;
 
 import java.lang.reflect.Method;
 
