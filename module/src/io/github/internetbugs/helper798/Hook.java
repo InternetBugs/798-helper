@@ -27,5 +27,6 @@ public class Hook extends XposedModule {
         AdBlock.install(this, cl);
         NavBlock.install(this, cl);
         MeBlock.install(this, cl);
+        AntiTouch.install(this, cl);
     }
 }

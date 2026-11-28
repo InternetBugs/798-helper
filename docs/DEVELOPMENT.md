@@ -17,6 +17,7 @@ module/
     AdBlock.java               广告位拦截
     NavBlock.java              底栏「积分」选项卡
     MeBlock.java               「我的」页积分入口
+    AntiTouch.java             用水防误触开关与自动续水守护
 build.sh                       构建脚本（本地与 CI 共用）
 ```
 
@@ -69,6 +70,16 @@ Kotlin 编译器为带默认参数的方法生成 `xxx$default` 合成方法，�
 触发时机：`MainActivity` 的 `onCreate`/`onResume`，以及 `ViewPager2.setCurrentItem`（切选项卡）。每次触发后以 200ms 间隔扫 15 次，覆盖 fragment 事务晚于回调完成布局的情况。删掉格子后如果父容器是 `LinearLayout`，剩下的格子重新设 `width=0, weight=1` 均分。
 
 `RecyclerView` / `ViewPager2` 不在 `android.jar` 里，模块不引 androidx，全部按类名 `Class.forName` 后走 `View` / `ViewGroup` 接口操作。
+
+## 用水防误触
+
+`AntiTouch` 在水控设备详情页（`DeviceCommonDetailActivity` 的 `mDeviceDetailUse` 顶部）与运行状态页（`StateCommonActivity` 的提示文案下方）各注入一个同步开关，默认关闭，状态持久化在宿主 `SharedPreferences`（`n798_helper_prefs` / `anti_touch_enabled`），仅对水控类 `ntype`（5/6/8/9/95/130）生效，排除洗衣机、吹风机等定次设备。
+
+运行时状态机基于以下 hook 点：
+
+1. **延长轮询**：宿主默认在 `DevStateHelper.B(20, 6000, onEach, null)` 中仅轮询 20 次（约 2 分钟）。开启防误触后，hook `DevStateHelper.B` 与 `DevStateHelper.s`，将其升级为 `7200 × 2000ms` 持续轮询，并配合看门狗和运行期局部 `PARTIAL_WAKE_LOCK` 覆盖长时用水与锁屏场景。
+2. **拦截机器端停水并续开**：当 `DevStateHelper.l(DeviceDetailData)` 将按钮状态从 `SETTLE_IMMEDIATELY` 变为 `USE_IMMEDIATELY` 且未触发手机端手动关水时，拦截 `DevStateHelper.n`、`DevStateHelper.o` 与 `EventBus.e(CloseAdPageEvent)` 阻止退出页面，并在 `DeviceCommonDetailActivity.D0` 抑制重复拉起 `StateCommonActivity`，同时通过 `DevControlHelper.t(false)` 重新下发开水指令（含冷却、退避重试及余额不足/异常终止保护）。
+3. **手机端手动关水**：hook `StateCommonActivity.onClick(mClUser)`、`DevControlHelper.i/w` 与 `DeviceViewModel.deviceEnd`，立即解除本次守护并释放 WakeLock；若刚好与在途续水并发，在 `DevControlHelper.s` 回调中补发一次 `DevControlHelper.i(false)` 确保可靠关水。
 
 ## 构建
 
