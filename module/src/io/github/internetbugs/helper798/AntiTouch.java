@@ -1,11 +1,23 @@
 package io.github.internetbugs.helper798;
 
 import android.app.Activity;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.ServiceInfo;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioTrack;
+import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
@@ -23,7 +35,6 @@ import android.widget.Toast;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.util.List;
 
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
@@ -36,8 +47,9 @@ import io.github.libxposed.api.XposedModule;
  * water session:
  *
  *   1. Extends DevStateHelper's status monitor beyond the host's default 20x6s (2 min) cap to
- *      continuous 2s polling (plus a watchdog and a partial WakeLock while active) so machine-side
- *      stops are detected quickly even during long showers or with the screen off.
+ *      continuous 2s polling (plus a watchdog) and promotes the host process with a real
+ *      dataSync Foreground Service + partial WakeLock + WifiLock so screen-off does not freeze
+ *      polling or cut off network sockets.
  *   2. When the server reports the device stopped without a phone-side manual stop (i.e. physical
  *      button touched on the machine), suppresses CloseAdPageEvent / Activity.finish() and
  *      automatically re-starts the device via DevControlHelper.t(false).
@@ -53,13 +65,29 @@ final class AntiTouch {
 
     private static final String CLS_DETAIL = "com.ilife.module.device.view.activity.DeviceCommonDetailActivity";
     private static final String CLS_STATE = "com.ilife.module.device.view.activity.StateCommonActivity";
-    private static final String CLS_BASE_DETAIL = "com.ilife.module.device.view.base.BaseDeviceDetailActivity";
     private static final String CLS_CTRL = "com.ilife.module.device.view.helper.DevControlHelper";
     private static final String CLS_STATE_HELPER = "com.ilife.module.device.view.helper.DevStateHelper";
     private static final String CLS_START_TIMEOUT = "com.ilife.module.device.view.helper.DevStateHelper$refreshAfterDeviceStart$2";
     private static final String CLS_VM = "com.ilife.lib.coremodel.http.vmx.DeviceViewModel";
     private static final String CLS_CACHE = "com.ilife.lib.common.data.DeviceCacheData";
     private static final String CLS_BUS = "com.ilife.lib.coremodel.bus.EventBus";
+
+    // Main-process services already declared in com.cloudora.android's manifest.
+    // The first four declare android:foregroundServiceType="dataSync" and are unused because
+    // AdBlock suppresses all ad downloads.
+    private static final String[] FGS_CANDIDATES = {
+            "com.yfanads.android.adx.thirdpart.filedownload.services.FileDownloadService$SharedMainProcessService",
+            "cj.mobile.fw.download.DownloadService",
+            "com.fancy.mpsdk.download.DownloadService",
+            "com.ltmb.ltsdk.core.fy.ptgapi.download.DownloadService",
+            "androidx.work.impl.foreground.SystemForegroundService",
+    };
+
+    private static final String EXTRA_GUARD_FGS = "n798_guard_fgs";
+    private static final String ACTION_GUARD_START = "io.github.internetbugs.helper798.GUARD_START";
+    private static final String ACTION_GUARD_STOP = "io.github.internetbugs.helper798.GUARD_STOP";
+    private static final String NOTIF_CHANNEL_ID = "n798_anti_touch_guard";
+    private static final int NOTIF_ID = 79801;
 
     private static final String TAG_DETAIL_BAR = "n798_anti_touch_detail_bar";
     private static final String TAG_STATE_CARD = "n798_anti_touch_state_card";
@@ -70,10 +98,11 @@ final class AntiTouch {
     private static final long RETRY_DELAY_MS = 2500L;
     private static final long RESTART_COOLDOWN_MS = 2000L;
     private static final long RESTART_TIMEOUT_MS = 16000L;
+    private static final long INITIAL_START_TIMEOUT_MS = 20000L;
     private static final long WATCHDOG_INTERVAL_MS = 5000L;
     private static final long POLL_STALE_MS = 8500L;
     private static final long WAKELOCK_MAX_MS = 2L * 60 * 60 * 1000;
-    private static final int MAX_CONSECUTIVE_FAILURES = 5;
+    private static final int MAX_CONSECUTIVE_FAILURES = 8;
 
     private enum State {
         IDLE,
@@ -102,18 +131,34 @@ final class AntiTouch {
     private static volatile int currentDeviceNtype = -1;
     private static volatile String errorNote;
 
+    private static Class<?> fgsServiceClass;
+    private static boolean fgsDeclaresDataSync;
+    private static volatile boolean fgsRunning;
+
     private static WeakReference<Activity> detailActRef = new WeakReference<>(null);
     private static WeakReference<Activity> stateActRef = new WeakReference<>(null);
     private static WeakReference<Object> ctrlHelperRef = new WeakReference<>(null);
     private static WeakReference<Object> stateHelperRef = new WeakReference<>(null);
     private static WeakReference<Object> monitorCbRef = new WeakReference<>(null);
+    private static WeakReference<Service> guardServiceRef = new WeakReference<>(null);
 
     private static PowerManager.WakeLock wakeLock;
+    private static WifiManager.WifiLock wifiLock;
+    private static AudioTrack silentAudioTrack;
 
     private static final Runnable RESTART_RUNNABLE = new Runnable() {
         @Override
         public void run() {
             performAutoRestart();
+        }
+    };
+
+    private static final Runnable INITIAL_START_TIMEOUT_RUNNABLE = new Runnable() {
+        @Override
+        public void run() {
+            if (state == State.STARTING) {
+                resetSession("initial start did not confirm within timeout");
+            }
         }
     };
 
@@ -130,7 +175,7 @@ final class AntiTouch {
     private static final Runnable WATCHDOG_RUNNABLE = new Runnable() {
         @Override
         public void run() {
-            if (!enabled || manualStop || state != State.RUNNING) return;
+            if (!enabled || manualStop || state != State.RUNNING || !isSupportedWaterDevice()) return;
             Activity detail = detailActRef.get();
             if (detail == null || detail.isFinishing() || detail.isDestroyed()) {
                 resetSession("detail activity gone");
@@ -217,16 +262,17 @@ final class AntiTouch {
 
         if (val) {
             if (state == State.RUNNING && !manualStop && isSupportedWaterDevice()) {
-                acquireWakeLock(ctx);
+                startKeepAlive(ctx);
                 lastPollMs = SystemClock.elapsedRealtime();
                 restartMonitorPolling(POLL_TIMES, POLL_INTERVAL_MS);
                 startWatchdog();
             }
         } else {
+            MAIN.removeCallbacks(INITIAL_START_TIMEOUT_RUNNABLE);
             MAIN.removeCallbacks(RESTART_RUNNABLE);
             MAIN.removeCallbacks(RESTART_TIMEOUT_RUNNABLE);
             MAIN.removeCallbacks(WATCHDOG_RUNNABLE);
-            releaseWakeLock();
+            stopKeepAlive(ctx);
             if (state == State.RESTARTING) {
                 state = State.IDLE;
             } else if (state == State.RUNNING) {
@@ -260,6 +306,7 @@ final class AntiTouch {
     // -------------------------------------------------------------------------
 
     private static void hookAll(XposedModule m, ClassLoader cl) {
+        hookForegroundService(m, cl);
         hookDetailActivity(m, cl);
         hookStateActivity(m, cl);
         hookControlHelper(m, cl);
@@ -267,6 +314,117 @@ final class AntiTouch {
         hookDeviceViewModel(m, cl);
         hookDeviceCache(m, cl);
         hookEventBus(m, cl);
+    }
+
+    private static void hookForegroundService(XposedModule m, ClassLoader cl) {
+        for (int i = 0; i < FGS_CANDIDATES.length; i++) {
+            String name = FGS_CANDIDATES[i];
+            Class<?> c = loadClass(cl, name);
+            if (c == null || !Service.class.isAssignableFrom(c)) continue;
+
+            Method onStartCommand = findMethodBelowService(c, "onStartCommand",
+                    Intent.class, int.class, int.class);
+            if (onStartCommand == null) {
+                log("skip FGS candidate without onStartCommand: " + name);
+                continue;
+            }
+
+            final Class<?> targetCls = c;
+            final boolean hasDataSync = (i < 4);
+            fgsServiceClass = targetCls;
+            fgsDeclaresDataSync = hasDataSync;
+
+            Method onCreate = findMethodBelowService(targetCls, "onCreate");
+            if (onCreate != null) {
+                hookExact(m, onCreate, new XposedInterface.Hooker() {
+                    @Override
+                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        if (chain.getThisObject().getClass() == targetCls) {
+                            return null;
+                        }
+                        return chain.proceed();
+                    }
+                });
+            }
+
+            hookExact(m, onStartCommand, new XposedInterface.Hooker() {
+                @Override
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object self = chain.getThisObject();
+                    if (self.getClass() != targetCls) return chain.proceed();
+                    Service svc = (Service) self;
+                    Intent intent = (Intent) chain.getArg(0);
+                    return handleGuardServiceCommand(svc, intent);
+                }
+            });
+
+            Method onBind = findMethodBelowService(targetCls, "onBind", Intent.class);
+            if (onBind != null) {
+                hookExact(m, onBind, new XposedInterface.Hooker() {
+                    @Override
+                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        if (chain.getThisObject().getClass() == targetCls) return null;
+                        return chain.proceed();
+                    }
+                });
+            }
+
+            Method onDestroy = findMethodBelowService(targetCls, "onDestroy");
+            if (onDestroy != null) {
+                hookExact(m, onDestroy, new XposedInterface.Hooker() {
+                    @Override
+                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        Object self = chain.getThisObject();
+                        if (self.getClass() == targetCls) {
+                            if (guardServiceRef.get() == self) {
+                                guardServiceRef = new WeakReference<>(null);
+                            }
+                            fgsRunning = false;
+                            log("guard FGS destroyed");
+                            return null;
+                        }
+                        return chain.proceed();
+                    }
+                });
+            }
+
+            log("hooked guard FGS host: " + name + " (dataSync=" + hasDataSync + ")");
+            return;
+        }
+        log("no candidate Foreground Service class resolved");
+    }
+
+    private static boolean isSessionKeepAliveAllowed() {
+        return enabled && !manualStop && isSupportedWaterDevice()
+                && (state == State.STARTING || state == State.RUNNING || state == State.RESTARTING);
+    }
+
+    private static int handleGuardServiceCommand(Service svc, Intent intent) {
+        if (intent != null && ACTION_GUARD_STOP.equals(intent.getAction())) {
+            fgsRunning = false;
+            guardServiceRef = new WeakReference<>(null);
+            stopForegroundCompat(svc);
+            svc.stopSelf();
+            log("guard FGS stopped");
+            return Service.START_NOT_STICKY;
+        }
+        if (isSessionKeepAliveAllowed()
+                && (isGuarding() || (intent != null && ACTION_GUARD_START.equals(intent.getAction())))) {
+            guardServiceRef = new WeakReference<>(svc);
+            try {
+                Notification notif = buildGuardNotification(svc);
+                startForegroundCompat(svc, notif);
+                fgsRunning = true;
+                log("guard FGS active (notification shown)");
+            } catch (Throwable t) {
+                log("startForeground failed: " + t);
+            }
+            return Service.START_NOT_STICKY;
+        }
+        fgsRunning = false;
+        stopForegroundCompat(svc);
+        svc.stopSelf();
+        return Service.START_NOT_STICKY;
     }
 
     private static void hookDetailActivity(XposedModule m, ClassLoader cl) {
@@ -382,7 +540,6 @@ final class AntiTouch {
                         boolean wasRestarting = (state == State.RESTARTING);
                         onManualStop("StateCommonActivity.onClick(mClUser)");
                         if (wasRestarting) {
-                            // Ensure deviceEnd is sent even if DeviceCacheData briefly held USE_IMMEDIATELY.
                             MAIN.post(new Runnable() {
                                 @Override
                                 public void run() {
@@ -445,6 +602,14 @@ final class AntiTouch {
                     errorNote = null;
                     state = State.STARTING;
                     log("user initiated device start via DevControlHelper.t");
+                    // Start FGS immediately while the Activity is definitely foreground so Android 12+
+                    // allows startForegroundService even if the user locks the screen 1s after tapping start.
+                    // Guarded by INITIAL_START_TIMEOUT_RUNNABLE so cancelled/aborted starts never linger.
+                    if (enabled && isSupportedWaterDevice()) {
+                        startKeepAlive(getAnyContext());
+                        MAIN.removeCallbacks(INITIAL_START_TIMEOUT_RUNNABLE);
+                        MAIN.postDelayed(INITIAL_START_TIMEOUT_RUNNABLE, INITIAL_START_TIMEOUT_MS);
+                    }
                     refreshAllUi();
                 }
                 return chain.proceed();
@@ -458,8 +623,6 @@ final class AntiTouch {
                 Object self = chain.getThisObject();
                 captureControlHelper(self);
                 if (manualStop) {
-                    // Race condition: user clicked manual stop while an auto-restart start request
-                    // was already on the wire. Stop the device immediately so water stays OFF.
                     log("deviceStart succeeded after manual stop; issuing immediate deviceEnd");
                     MAIN.post(new Runnable() {
                         @Override
@@ -483,7 +646,6 @@ final class AntiTouch {
                 if (state == State.RESTARTING && enabled && !manualStop) {
                     boolean willRetry = onAutoRestartError(code, msg);
                     if (willRetry) {
-                        // Suppress transient error dialog while retrying automatically.
                         return null;
                     }
                 } else if (state == State.STARTING) {
@@ -551,7 +713,6 @@ final class AntiTouch {
                                 lastMonitorStartMs = SystemClock.elapsedRealtime();
                             }
                         } else if (state == State.RESTARTING && enabled && !manualStop && times == 4 && interval == 3000L) {
-                            // Confirm auto-restart a bit faster and with more patience (6x2s).
                             return chain.proceed(new Object[]{6, 2000L, onEach, onComplete});
                         }
                         return chain.proceed();
@@ -623,6 +784,8 @@ final class AntiTouch {
                         if (onAutoRestartError(-2, "设备未响应启动")) {
                             return null;
                         }
+                    } else if (state == State.STARTING) {
+                        resetSession("initial start poll timed out");
                     }
                     return chain.proceed();
                 }
@@ -672,9 +835,7 @@ final class AntiTouch {
                                         lastPollMs = SystemClock.elapsedRealtime();
                                         log("detected already-running session from button state: " + name);
                                         if (enabled && isSupportedWaterDevice()) {
-                                            Activity ctx = detailActRef.get();
-                                            if (ctx == null) ctx = stateActRef.get();
-                                            acquireWakeLock(ctx);
+                                            startKeepAlive(getAnyContext());
                                             startWatchdog();
                                         }
                                         refreshAllUi();
@@ -743,27 +904,21 @@ final class AntiTouch {
         boolean runningNow = "SETTLE_IMMEDIATELY".equals(btn) || "RUNNING".equals(btn);
 
         if (runningNow) {
-            if (manualStop) {
-                // Waiting for deviceEnd to take effect; do not re-arm.
-                return;
-            }
+            if (manualStop) return;
             boolean wasRestarting = (state == State.RESTARTING);
             boolean transitioned = (state != State.RUNNING);
             state = State.RUNNING;
             consecutiveFailures = 0;
             errorNote = null;
+            MAIN.removeCallbacks(INITIAL_START_TIMEOUT_RUNNABLE);
             MAIN.removeCallbacks(RESTART_TIMEOUT_RUNNABLE);
 
             if (transitioned) {
                 log("session RUNNING confirmed (wasRestarting=" + wasRestarting + ", restarts=" + restartCount + ")");
                 if (enabled && isSupportedWaterDevice()) {
-                    Activity ctx = detailActRef.get();
-                    if (ctx == null) ctx = stateActRef.get();
-                    acquireWakeLock(ctx);
+                    startKeepAlive(getAnyContext());
                     startWatchdog();
                     final long confirmTime = SystemClock.elapsedRealtime();
-                    // Ensure continuous 2s polling is active even if refreshAfterDeviceStart$1 skipped
-                    // restarting B(...) due to its one-shot guard flag or direct entry into a running device.
                     MAIN.postDelayed(new Runnable() {
                         @Override
                         public void run() {
@@ -781,6 +936,7 @@ final class AntiTouch {
                         refreshStateActivityUi(sa);
                     }
                 }
+                updateGuardNotification();
                 refreshAllUi();
             }
             return;
@@ -790,12 +946,6 @@ final class AntiTouch {
         if (state == State.RUNNING && enabled && !manualStop && isSupportedWaterDevice()) {
             int devStatus = extractDeviceStatus(deviceDetailData);
             log("machine-side stop detected! btn=" + btn + " devStatus=" + devStatus);
-
-            if (devStatus == 0 || devStatus == 2 || devStatus == 98 || devStatus == 99) {
-                // Offline, error, or locked — still try limited retries in case of transient flap,
-                // unless already offline repeatedly.
-                log("device status abnormal (" + devStatus + "), scheduling guarded check/retry");
-            }
 
             state = State.RESTARTING;
             errorNote = null;
@@ -807,10 +957,10 @@ final class AntiTouch {
             if (sa != null && !sa.isFinishing() && !sa.isDestroyed()) {
                 keepStateStopButtonVisible(sa);
             }
+            updateGuardNotification();
             refreshAllUi();
             MAIN.postDelayed(RESTART_RUNNABLE, RESTART_DELAY_MS);
         } else if (state == State.RUNNING && !enabled) {
-            // Normal non-guarded stop on the machine.
             resetSession("machine stop while guard disabled");
         }
     }
@@ -836,6 +986,7 @@ final class AntiTouch {
         lastRestartAttemptMs = now;
         restartCount++;
         log("triggering auto-restart #" + restartCount + " via DevControlHelper.t(false)");
+        updateGuardNotification();
         refreshAllUi();
 
         MAIN.removeCallbacks(RESTART_TIMEOUT_RUNNABLE);
@@ -874,7 +1025,7 @@ final class AntiTouch {
             state = State.IDLE;
             MAIN.removeCallbacks(RESTART_RUNNABLE);
             MAIN.removeCallbacks(WATCHDOG_RUNNABLE);
-            releaseWakeLock();
+            stopKeepAlive(getAnyContext());
             refreshAllUi();
             showToast(errorNote);
             return false;
@@ -882,6 +1033,7 @@ final class AntiTouch {
 
         errorNote = "续水重试中(" + consecutiveFailures + "/" + MAX_CONSECUTIVE_FAILURES + ")"
                 + (text.isEmpty() ? "" : "：" + text);
+        updateGuardNotification();
         refreshAllUi();
         MAIN.removeCallbacks(RESTART_RUNNABLE);
         MAIN.postDelayed(RESTART_RUNNABLE, RETRY_DELAY_MS);
@@ -894,10 +1046,11 @@ final class AntiTouch {
         state = State.IDLE;
         errorNote = null;
         consecutiveFailures = 0;
+        MAIN.removeCallbacks(INITIAL_START_TIMEOUT_RUNNABLE);
         MAIN.removeCallbacks(RESTART_RUNNABLE);
         MAIN.removeCallbacks(RESTART_TIMEOUT_RUNNABLE);
         MAIN.removeCallbacks(WATCHDOG_RUNNABLE);
-        releaseWakeLock();
+        stopKeepAlive(getAnyContext());
         refreshAllUi();
     }
 
@@ -907,10 +1060,11 @@ final class AntiTouch {
         manualStop = false;
         errorNote = null;
         consecutiveFailures = 0;
+        MAIN.removeCallbacks(INITIAL_START_TIMEOUT_RUNNABLE);
         MAIN.removeCallbacks(RESTART_RUNNABLE);
         MAIN.removeCallbacks(RESTART_TIMEOUT_RUNNABLE);
         MAIN.removeCallbacks(WATCHDOG_RUNNABLE);
-        releaseWakeLock();
+        stopKeepAlive(getAnyContext());
         refreshAllUi();
     }
 
@@ -967,35 +1121,292 @@ final class AntiTouch {
         });
     }
 
-    private static void acquireWakeLock(Context ctx) {
+    // -------------------------------------------------------------------------
+    // Keep-Alive: Foreground Service + WakeLock + WifiLock
+    // -------------------------------------------------------------------------
+
+    private static void startKeepAlive(Context ctx) {
+        if (!isSessionKeepAliveAllowed()) return;
+        acquireLocks(ctx);
+        startSilentAudio();
+        startGuardService(ctx);
+    }
+
+    private static void stopKeepAlive(Context ctx) {
+        stopGuardService(ctx);
+        stopSilentAudio();
+        releaseLocks();
+    }
+
+    /**
+     * Plays an inaudible all-zero PCM loop without requesting audio focus (so music/podcasts are
+     * unaffected). Aggressive OEM freezers such as Xiaomi HyperOS GreezeManager still freeze
+     * third-party dataSync foreground services on screen-off, but exempt processes with active
+     * audio playback.
+     */
+    private static void startSilentAudio() {
         synchronized (LOCK) {
-            if (wakeLock != null && wakeLock.isHeld()) return;
-            if (ctx == null) return;
+            if (silentAudioTrack != null) return;
             try {
-                PowerManager pm = (PowerManager) ctx.getApplicationContext().getSystemService(Context.POWER_SERVICE);
-                if (pm == null) return;
-                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "n798:AntiTouchGuard");
-                wakeLock.setReferenceCounted(false);
-                wakeLock.acquire(WAKELOCK_MAX_MS);
-                log("acquired partial WakeLock");
+                int sampleRate = 8000;
+                int minBuf = AudioTrack.getMinBufferSize(
+                        sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                int frames = Math.max(sampleRate, (Math.max(minBuf, 0) + 1) / 2);
+                short[] silence = new short[frames];
+                int bufBytes = frames * 2;
+                AudioAttributes attrs = new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build();
+                AudioFormat fmt = new AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build();
+                AudioTrack track = new AudioTrack.Builder()
+                        .setAudioAttributes(attrs)
+                        .setAudioFormat(fmt)
+                        .setBufferSizeInBytes(bufBytes)
+                        .setTransferMode(AudioTrack.MODE_STATIC)
+                        .build();
+                track.write(silence, 0, silence.length);
+                track.setLoopPoints(0, frames, -1);
+                track.setVolume(0.01f);
+                track.play();
+                silentAudioTrack = track;
+                log("started silent AudioTrack keep-alive");
             } catch (Throwable t) {
-                log("acquire WakeLock failed: " + t);
+                log("startSilentAudio failed: " + t);
             }
         }
     }
 
-    private static void releaseWakeLock() {
+    private static void stopSilentAudio() {
         synchronized (LOCK) {
-            if (wakeLock == null) return;
+            if (silentAudioTrack == null) return;
             try {
-                if (wakeLock.isHeld()) {
-                    wakeLock.release();
-                    log("released partial WakeLock");
-                }
+                silentAudioTrack.pause();
+                silentAudioTrack.flush();
+                silentAudioTrack.stop();
             } catch (Throwable ignored) {
             }
-            wakeLock = null;
+            try {
+                silentAudioTrack.release();
+                log("stopped silent AudioTrack keep-alive");
+            } catch (Throwable ignored) {
+            }
+            silentAudioTrack = null;
         }
+    }
+
+    private static void startGuardService(Context ctx) {
+        if (fgsServiceClass == null || ctx == null) return;
+        if (fgsRunning) {
+            updateGuardNotification();
+            return;
+        }
+        try {
+            Context app = ctx.getApplicationContext();
+            Intent intent = new Intent(app, fgsServiceClass);
+            intent.setAction(ACTION_GUARD_START);
+            intent.putExtra(EXTRA_GUARD_FGS, true);
+            if (Build.VERSION.SDK_INT >= 26) {
+                app.startForegroundService(intent);
+            } else {
+                app.startService(intent);
+            }
+            log("requested startForegroundService(" + fgsServiceClass.getSimpleName() + ")");
+        } catch (Throwable t) {
+            log("startGuardService failed: " + t);
+        }
+    }
+
+    private static void stopGuardService(Context ctx) {
+        Service svc = guardServiceRef.get();
+        if (svc != null) {
+            try {
+                stopForegroundCompat(svc);
+                svc.stopSelf();
+                guardServiceRef = new WeakReference<>(null);
+                fgsRunning = false;
+                log("stopped guard FGS directly");
+                return;
+            } catch (Throwable ignored) {
+            }
+        }
+        if (!fgsRunning && fgsServiceClass == null) return;
+        fgsRunning = false;
+        if (fgsServiceClass == null || ctx == null) return;
+        try {
+            Context app = ctx.getApplicationContext();
+            Intent intent = new Intent(app, fgsServiceClass);
+            app.stopService(intent);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void updateGuardNotification() {
+        if (!fgsRunning) return;
+        Context ctx = guardServiceRef.get();
+        if (ctx == null) ctx = getAnyContext();
+        if (ctx == null) return;
+        try {
+            NotificationManager nm = (NotificationManager) ctx.getApplicationContext()
+                    .getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) {
+                nm.notify(NOTIF_ID, buildGuardNotification(ctx.getApplicationContext()));
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static Notification buildGuardNotification(Context ctx) {
+        Context app = ctx.getApplicationContext();
+        if (Build.VERSION.SDK_INT >= 26) {
+            NotificationManager nm = (NotificationManager) app.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null && nm.getNotificationChannel(NOTIF_CHANNEL_ID) == null) {
+                NotificationChannel ch = new NotificationChannel(
+                        NOTIF_CHANNEL_ID, "用水防误触守护", NotificationManager.IMPORTANCE_LOW);
+                ch.setDescription("开启用水防误触时保持后台监测，避免息屏断网或被系统冻结");
+                ch.setShowBadge(false);
+                ch.setSound(null, null);
+                nm.createNotificationChannel(ch);
+            }
+        }
+
+        String title;
+        String text;
+        if (state == State.RESTARTING) {
+            title = "798 防误触 · 正在自动续水…";
+            text = "检测到机器端停水，正在重新下发开水指令";
+        } else if (restartCount > 0) {
+            title = "798 防误触守护中（已续水 " + restartCount + " 次）";
+            text = "仅手机端「立即结算」关水生效，点此返回设备页";
+        } else {
+            title = "798 防误触守护中";
+            text = "持续监测水控状态，机器误触停水将自动续开";
+        }
+
+        Intent openIntent = null;
+        Activity target = stateActRef.get();
+        if (target == null || target.isFinishing() || target.isDestroyed()) {
+            target = detailActRef.get();
+        }
+        if (target != null && !target.isFinishing() && !target.isDestroyed()) {
+            openIntent = new Intent(app, target.getClass());
+            openIntent.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    | Intent.FLAG_ACTIVITY_NEW_TASK);
+        } else {
+            openIntent = app.getPackageManager().getLaunchIntentForPackage(app.getPackageName());
+        }
+        int piFlags = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
+        PendingIntent pi = openIntent == null ? null : PendingIntent.getActivity(app, 0, openIntent, piFlags);
+
+        Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(app, NOTIF_CHANNEL_ID)
+                : new Notification.Builder(app);
+        int icon = app.getApplicationInfo().icon;
+        if (icon == 0) icon = android.R.drawable.ic_lock_idle_lock;
+        b.setSmallIcon(icon)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true);
+        if (pi != null) b.setContentIntent(pi);
+        if (Build.VERSION.SDK_INT >= 31) {
+            b.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
+        }
+        return b.build();
+    }
+
+    @SuppressWarnings("deprecation")
+    private static void startForegroundCompat(Service svc, Notification notif) {
+        if (Build.VERSION.SDK_INT >= 29 && fgsDeclaresDataSync) {
+            svc.startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+        } else {
+            svc.startForeground(NOTIF_ID, notif);
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static void stopForegroundCompat(Service svc) {
+        if (Build.VERSION.SDK_INT >= 24) {
+            svc.stopForeground(Service.STOP_FOREGROUND_REMOVE);
+        } else {
+            svc.stopForeground(true);
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static void acquireLocks(Context ctx) {
+        synchronized (LOCK) {
+            if (ctx == null) return;
+            Context app = ctx.getApplicationContext();
+            try {
+                if (wakeLock == null || !wakeLock.isHeld()) {
+                    PowerManager pm = (PowerManager) app.getSystemService(Context.POWER_SERVICE);
+                    if (pm != null) {
+                        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "n798:AntiTouchGuard");
+                        wakeLock.setReferenceCounted(false);
+                        wakeLock.acquire(WAKELOCK_MAX_MS);
+                        log("acquired partial WakeLock");
+                    }
+                }
+            } catch (Throwable t) {
+                log("acquire WakeLock failed: " + t);
+            }
+            try {
+                if (wifiLock == null || !wifiLock.isHeld()) {
+                    WifiManager wm = (WifiManager) app.getSystemService(Context.WIFI_SERVICE);
+                    if (wm != null) {
+                        int mode = Build.VERSION.SDK_INT >= 29
+                                ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                                : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                        wifiLock = wm.createWifiLock(mode, "n798:AntiTouchWifi");
+                        wifiLock.setReferenceCounted(false);
+                        wifiLock.acquire();
+                        log("acquired WifiLock");
+                    }
+                }
+            } catch (Throwable t) {
+                log("acquire WifiLock failed: " + t);
+            }
+        }
+    }
+
+    private static void releaseLocks() {
+        synchronized (LOCK) {
+            if (wakeLock != null) {
+                try {
+                    if (wakeLock.isHeld()) {
+                        wakeLock.release();
+                        log("released partial WakeLock");
+                    }
+                } catch (Throwable ignored) {
+                }
+                wakeLock = null;
+            }
+            if (wifiLock != null) {
+                try {
+                    if (wifiLock.isHeld()) {
+                        wifiLock.release();
+                        log("released WifiLock");
+                    }
+                } catch (Throwable ignored) {
+                }
+                wifiLock = null;
+            }
+        }
+    }
+
+    private static Context getAnyContext() {
+        Activity a = stateActRef.get();
+        if (a != null && !a.isDestroyed()) return a;
+        a = detailActRef.get();
+        if (a != null && !a.isDestroyed()) return a;
+        Service s = guardServiceRef.get();
+        return s;
     }
 
     // -------------------------------------------------------------------------
@@ -1046,7 +1457,6 @@ final class AntiTouch {
         wrapper.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // Top hairline divider
         View divider = new View(act);
         divider.setBackgroundColor(Color.parseColor("#EEF1F6"));
         wrapper.addView(divider, new LinearLayout.LayoutParams(
@@ -1163,7 +1573,6 @@ final class AntiTouch {
         }
 
         LinearLayout card = buildStateCard(act);
-        // Insert right after the "可直接在设备上按键退出" hint text (index 3 when present).
         int insertIndex = Math.min(3, container.getChildCount());
         container.addView(card, insertIndex);
         updateStateCardView(card);
@@ -1394,8 +1803,7 @@ final class AntiTouch {
         MAIN.post(new Runnable() {
             @Override
             public void run() {
-                Context ctx = stateActRef.get();
-                if (ctx == null) ctx = detailActRef.get();
+                Context ctx = getAnyContext();
                 if (ctx == null) return;
                 try {
                     Toast.makeText(ctx.getApplicationContext(), msg, Toast.LENGTH_LONG).show();
@@ -1447,8 +1855,25 @@ final class AntiTouch {
         try {
             return Class.forName(name, false, cl);
         } catch (Throwable t) {
-            log("no class " + name + ": " + t);
             return null;
+        }
+    }
+
+    private static Method findMethodBelowService(Class<?> cls, String name, Class<?>... params) {
+        for (Class<?> c = cls; c != null && c != Service.class && c != Object.class; c = c.getSuperclass()) {
+            try {
+                return c.getDeclaredMethod(name, params);
+            } catch (NoSuchMethodException ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static void hookExact(XposedModule m, Method method, XposedInterface.Hooker hooker) {
+        try {
+            m.hook(method).intercept(hooker);
+        } catch (Throwable t) {
+            log("hook " + method.getDeclaringClass().getSimpleName() + "#" + method.getName() + " failed: " + t);
         }
     }
 

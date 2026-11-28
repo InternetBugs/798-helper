@@ -77,7 +77,7 @@ Kotlin 编译器为带默认参数的方法生成 `xxx$default` 合成方法，�
 
 运行时状态机基于以下 hook 点：
 
-1. **延长轮询**：宿主默认在 `DevStateHelper.B(20, 6000, onEach, null)` 中仅轮询 20 次（约 2 分钟）。开启防误触后，hook `DevStateHelper.B` 与 `DevStateHelper.s`，将其升级为 `7200 × 2000ms` 持续轮询，并配合看门狗和运行期局部 `PARTIAL_WAKE_LOCK` 覆盖长时用水与锁屏场景。
+1. **延长轮询与息屏保活**：宿主默认在 `DevStateHelper.B(20, 6000, onEach, null)` 中仅轮询 20 次（约 2 分钟）。开启防误触后，hook `DevStateHelper.B` 与 `DevStateHelper.s`，将其升级为 `7200 × 2000ms` 持续轮询并配看门狗；同时复用宿主主进程已声明的 `dataSync` 服务（`FileDownloadService$SharedMainProcessService` 等）启动前台服务常驻通知，叠加 `PARTIAL_WAKE_LOCK`、`WifiLock` 与不抢焦点的全零静态 `AudioTrack` 静音循环（应对 HyperOS `GreezeManager` 在默认省电策略下对第三方 `dataSync` 前台服务依然息屏冻结的问题，触发 `active audio` 豁免），手动关水或退出页面时全部释放。
 2. **拦截机器端停水并续开**：当 `DevStateHelper.l(DeviceDetailData)` 将按钮状态从 `SETTLE_IMMEDIATELY` 变为 `USE_IMMEDIATELY` 且未触发手机端手动关水时，拦截 `DevStateHelper.n`、`DevStateHelper.o` 与 `EventBus.e(CloseAdPageEvent)` 阻止退出页面，并在 `DeviceCommonDetailActivity.D0` 抑制重复拉起 `StateCommonActivity`，同时通过 `DevControlHelper.t(false)` 重新下发开水指令（含冷却、退避重试及余额不足/异常终止保护）。
 3. **手机端手动关水**：hook `StateCommonActivity.onClick(mClUser)`、`DevControlHelper.i/w` 与 `DeviceViewModel.deviceEnd`，立即解除本次守护并释放 WakeLock；若刚好与在途续水并发，在 `DevControlHelper.s` 回调中补发一次 `DevControlHelper.i(false)` 确保可靠关水。
 
